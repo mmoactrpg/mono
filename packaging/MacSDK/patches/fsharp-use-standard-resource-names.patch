@@ -1,0 +1,279 @@
+From efb0c3eac5c66e704d8498fe66d9def990357c99 Mon Sep 17 00:00:00 2001
+From: nosami <jasonimison@gmail.com>
+Date: Wed, 19 Jul 2017 16:51:52 +0100
+Subject: [PATCH 1/2] Make F# resources work more like C#
+
+Given a resource in a folder named `AFolder/AResourceFile.txt` in a project with
+a root namespace of `fsharpresources`, then the following command line arg
+should be passed to the compiler
+
+```
+--resource:AFolder/AResourceFile.txt,fsharpresources.AFolder.AResourceFile.txt
+```
+
+whereas currently it just passes the name of the file. This also fixes passing
+a `LogicalName` to the resource.
+
+Fixes https://github.com/Microsoft/visualfsharp/issues/1050 &&
+https://github.com/Microsoft/visualfsharp/issues/922
+
+I looked at how Roslyn was doing this [here](https://github.com/dotnet/roslyn/blob/6847f1e5a909395aae9456e8f366cbf4deb86b69/src/Compilers/Core/MSBuildTask/ManagedCompiler.cs#L739)
+es. Lines starting
+---
+ .../CreateFSharpManifestResourceName.fs             | 21 +--------------------
+ src/fsharp/FSharp.Build/Fsc.fs                      | 11 +++++++++--
+ 2 files changed, 10 insertions(+), 22 deletions(-)
+
+diff --git a/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs b/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs
+index cdb37b649..fdc9ac910 100755
+--- a/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs
++++ b/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs
+@@ -23,24 +23,6 @@ type CreateFSharpManifestResourceName public () =
+         //
+         // For resx resources, both the Visual FSharp and XBuild FSHarp toolchains do the right thing, i.e.
+         //     SubDir\abc.resx --> SubDir.abc.resources
+-        //
+-        // However for non-resx resources, for some reason Visual FSharp does _not_ add the directory name to the resource name.
+-        // It is very unclear where the directory name gets dropped in the Visual FSharp implementation 
+-        // - is it in Microsoft.Common.targets, Microsoft.FSharp.Targets or how the base type CreateCSharpManifestResourceName 
+-        // is created and used - who knows, the code is not easy to understand despite it doing something very simple. That's
+-        // the nature of MSBuild/XBuild....
+-        //
+-        // Anyway, dropping the directory name seems like a mistake. But we attempt to replicate the behaviour here
+-        // for consistency with Visual FSharp. This may not be the right place to do this and this many not be consistent
+-        // when cultures are used - that case has not been tested.
+-
+-        let runningOnMono = 
+-            try
+-                System.Type.GetType("Mono.Runtime") <> null
+-            with e -> 
+-                false  
+-        let fileName = if not runningOnMono || fileName.EndsWith(".resources", StringComparison.OrdinalIgnoreCase) then fileName else Path.GetFileName(fileName)
+-        let linkFileName = if not runningOnMono || linkFileName.EndsWith(".resources", StringComparison.OrdinalIgnoreCase) then linkFileName else Path.GetFileName(linkFileName)
+ 
+         let embeddedFileName = 
+             match linkFileName with
+@@ -48,9 +30,8 @@ type CreateFSharpManifestResourceName public () =
+             |   _ -> linkFileName
+ 
+         // since we do not support resources dependent on a form, we always pass null for a binary stream 
+-        // rootNamespace is always empty - we do not support it
+         let cSharpResult = 
+-            base.CreateManifestName(fileName, linkFileName,  "", dependentUponFileName, null)
++            base.CreateManifestName(fileName, linkFileName, rootNamespace, dependentUponFileName, null)
+         // Workaround that makes us keep .resources extension on both 3.5 and 3.5SP1
+         // 3.5 stripped ".resources", 3.5 SP1 does not. We should do 3.5SP1  thing
+         let extensionToWorkaround = ".resources"
+diff --git a/src/fsharp/FSharp.Build/Fsc.fs b/src/fsharp/FSharp.Build/Fsc.fs
+index b8d025cfd..f004d071d 100755
+--- a/src/fsharp/FSharp.Build/Fsc.fs
++++ b/src/fsharp/FSharp.Build/Fsc.fs
+@@ -60,10 +60,17 @@ type FscCommandLineBuilder () =
+         if s <> String.Empty then
+             args <- s :: args
+ 
+-    member x.AppendSwitchIfNotNull(switch:string, value:string) =
++    member x.AppendSwitchIfNotNull(switch:string, value:string, ?metadataNames:string array) =
++        let metadataNames = defaultArg metadataNames [||]
+         builder.AppendSwitchIfNotNull(switch, value)
+         let tmp = new CommandLineBuilder()
+         tmp.AppendSwitchUnquotedIfNotNull(switch, value)
++        let providedMetaData =
++            metadataNames
++            |> Array.filter (String.IsNullOrWhiteSpace >> not)
++        if providedMetaData.Length > 0 then
++            tmp.AppendTextUnquoted ","
++            tmp.AppendTextUnquoted (providedMetaData|> String.concat ",")
+         let s = tmp.ToString()
+         if s <> String.Empty then
+             args <- s :: args
+@@ -242,7 +249,7 @@ type [<Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1704:Iden
+         // Resources
+         if resources <> null then 
+             for item in resources do
+-                builder.AppendSwitchIfNotNull("--resource:", item.ItemSpec)
++                builder.AppendSwitchIfNotNull("--resource:", item.ItemSpec, [|item.GetMetadata("LogicalName"); item.GetMetadata("Access")|])
+         // VersionFile
+         builder.AppendSwitchIfNotNull("--versionfile:", versionFile)
+         // References
+
+From c552a5a1751a1973cbcc7b423486fefdb62134a8 Mon Sep 17 00:00:00 2001
+From: nosami <jasonimison@gmail.com>
+Date: Thu, 20 Jul 2017 16:11:37 +0100
+Subject: [PATCH 2/2] Add a UseStandardResourceNames flag (disabled by default)
+
+With
+```
+    <UseStandardResourceNames>true</UseStandardResourceNames>
+```
+we get the following output
+
+```
+--resource:AFolder/AResourceFile.txt,fsharpresource.AFolder.AResourceFile.txt
+```
+
+With the value omitted or set to false, the behaviour is as it was previously.
+
+```
+--resource:AFolder/AResourceFile.txt
+```
+---
+ .../FSharp.Build/CreateFSharpManifestResourceName.fs  | 19 ++++++++++++++++++-
+ .../FSharp.Build/CreateFSharpManifestResourceName.fsi |  1 +
+ src/fsharp/FSharp.Build/Fsc.fs                        | 11 +++++++++--
+ src/fsharp/FSharp.Build/Fsc.fsi                       |  1 +
+ src/fsharp/FSharp.Build/Microsoft.FSharp.Targets      |  7 +++++++
+ 5 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs b/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs
+index fdc9ac910..76d78016c 100755
+--- a/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs
++++ b/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fs
+@@ -9,7 +9,10 @@ open Microsoft.Build.Utilities
+ 
+ type CreateFSharpManifestResourceName public () =
+     inherit CreateCSharpManifestResourceName()
+-    
++
++    // When set to true, generate resource names in the same way as C# with root namespace and folder names
++    member val UseStandardResourceNames = false with get, set
++
+     override this.CreateManifestName 
+                 ((fileName:string), 
+                     (linkFileName:string),
+@@ -24,6 +27,20 @@ type CreateFSharpManifestResourceName public () =
+         // For resx resources, both the Visual FSharp and XBuild FSHarp toolchains do the right thing, i.e.
+         //     SubDir\abc.resx --> SubDir.abc.resources
+ 
++        let fileName, linkFileName, rootNamespace =
++            match this.UseStandardResourceNames with
++            | true ->
++                fileName, linkFileName, rootNamespace
++            | false ->
++                let runningOnMono = 
++                    try
++                        System.Type.GetType("Mono.Runtime") <> null
++                    with e -> 
++                        false  
++                let fileName = if not runningOnMono || fileName.EndsWith(".resources", StringComparison.OrdinalIgnoreCase) then fileName else Path.GetFileName(fileName)
++                let linkFileName = if not runningOnMono || linkFileName.EndsWith(".resources", StringComparison.OrdinalIgnoreCase) then linkFileName else Path.GetFileName(linkFileName)
++                fileName, linkFileName, "" 
++
+         let embeddedFileName = 
+             match linkFileName with
+             |   null -> fileName
+diff --git a/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fsi b/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fsi
+index e5e700a1a..71d87331c 100755
+--- a/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fsi
++++ b/src/fsharp/FSharp.Build/CreateFSharpManifestResourceName.fsi
+@@ -6,3 +6,4 @@ namespace Microsoft.FSharp.Build
+ type CreateFSharpManifestResourceName =
+     inherit Microsoft.Build.Tasks.CreateCSharpManifestResourceName
+     public new : unit -> CreateFSharpManifestResourceName
++    member UseStandardResourceNames : bool with get,set
+\ No newline at end of file
+diff --git a/src/fsharp/FSharp.Build/Fsc.fs b/src/fsharp/FSharp.Build/Fsc.fs
+index f004d071d..3daeacdd4 100755
+--- a/src/fsharp/FSharp.Build/Fsc.fs
++++ b/src/fsharp/FSharp.Build/Fsc.fs
+@@ -167,6 +167,7 @@ type [<Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1704:Iden
+         | Some s -> s
+         | None -> ""
+     let mutable treatWarningsAsErrors : bool = false
++    let mutable useStandardResourceNames : bool = false
+     let mutable warningsAsErrors : string = null
+     let mutable versionFile : string = null
+     let mutable warningLevel : string = null
+@@ -249,7 +250,10 @@ type [<Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1704:Iden
+         // Resources
+         if resources <> null then 
+             for item in resources do
+-                builder.AppendSwitchIfNotNull("--resource:", item.ItemSpec, [|item.GetMetadata("LogicalName"); item.GetMetadata("Access")|])
++                match useStandardResourceNames with
++                | true -> builder.AppendSwitchIfNotNull("--resource:", item.ItemSpec, [|item.GetMetadata("LogicalName"); item.GetMetadata("Access")|])
++                | false -> builder.AppendSwitchIfNotNull("--resource:", item.ItemSpec)
++                
+         // VersionFile
+         builder.AppendSwitchIfNotNull("--versionfile:", versionFile)
+         // References
+@@ -457,7 +461,10 @@ type [<Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1704:Iden
+     member fsc.TargetType
+         with get() = targetType
+         and set(s) = targetType <- s
+-
++    // When set to true, generate resource names in the same way as C# with root namespace and folder names
++    member fsc.UseStandardResourceNames
++        with get() = useStandardResourceNames
++        and set(s) = useStandardResourceNames <- s
+     // --version-file <string>: 
+     member fsc.VersionFile
+         with get() = versionFile
+diff --git a/src/fsharp/FSharp.Build/Fsc.fsi b/src/fsharp/FSharp.Build/Fsc.fsi
+index 9fe31c7fb..7c81f3b5a 100755
+--- a/src/fsharp/FSharp.Build/Fsc.fsi
++++ b/src/fsharp/FSharp.Build/Fsc.fsi
+@@ -46,6 +46,7 @@ type Fsc = class
+              member TargetType : string with get,set
+              member ToolPath : string with get,set
+              member TreatWarningsAsErrors : bool with get,set
++             member UseStandardResourceNames : bool with get,set
+              member Utf8Output : bool with get,set
+              member VisualStudioStyleErrors : bool with get,set
+              member LCID : string with get,set
+diff --git a/src/fsharp/FSharp.Build/Microsoft.FSharp.Targets b/src/fsharp/FSharp.Build/Microsoft.FSharp.Targets
+index 7e1633403..34d716485 100644
+--- a/src/fsharp/FSharp.Build/Microsoft.FSharp.Targets
++++ b/src/fsharp/FSharp.Build/Microsoft.FSharp.Targets
+@@ -89,24 +89,28 @@ this file.
+ 
+         <CreateFSharpManifestResourceName
+              Condition="'@(ResxWithNoCulture)' != '' AND '$(UsingXBuild)' == 'true'"
++             UseStandardResourceNames="$(UseStandardResourceNames)"
+          ResourceFiles="@(ResxWithNoCulture)" RootNamespace="$(RootNamespace)">
+             <Output TaskParameter = "ManifestResourceNames" ItemName = "ManifestResourceWithNoCultureName" />
+         </CreateFSharpManifestResourceName>
+ 
+         <CreateFSharpManifestResourceName
+              Condition="'@(NonResxWithNoCulture)' != '' AND '$(UsingXBuild)' == 'true'"
++             UseStandardResourceNames="$(UseStandardResourceNames)"
+          ResourceFiles="@(NonResxWithNoCulture)" RootNamespace="$(RootNamespace)">
+             <Output TaskParameter = "ManifestResourceNames" ItemName = "ManifestNonResxWithNoCulture" />
+         </CreateFSharpManifestResourceName>
+ 
+         <CreateFSharpManifestResourceName
+              Condition="'@(ResxWithCulture)' != '' AND '$(UsingXBuild)' == 'true'"
++             UseStandardResourceNames="$(UseStandardResourceNames)"
+              ResourceFiles="@(ResxWithCulture)" RootNamespace="$(RootNamespace)">
+             <Output TaskParameter = "ManifestResourceNames" ItemName = "ManifestResourceWithCultureName" />
+         </CreateFSharpManifestResourceName>
+ 
+         <CreateFSharpManifestResourceName
+              Condition="'@(NonResxWithCulture)' != '' AND '$(UsingXBuild)' == 'true'"
++             UseStandardResourceNames="$(UseStandardResourceNames)"
+              ResourceFiles="@(NonResxWithCulture)" RootNamespace="$(RootNamespace)">
+             <Output TaskParameter = "ManifestResourceNames" ItemName = "ManifestNonResxWithCulture" />
+         </CreateFSharpManifestResourceName>
+@@ -123,6 +127,7 @@ this file.
+         <CreateFSharpManifestResourceName
+               ResourceFiles="@(EmbeddedResource)"
+               RootNamespace="$(RootNamespace)"
++              UseStandardResourceNames="$(UseStandardResourceNames)"
+               Condition="'%(EmbeddedResource.ManifestResourceName)' == '' and ('%(EmbeddedResource.WithCulture)' == 'false' or '%(EmbeddedResource.Type)' == 'Resx') AND '$(UsingXBuild)' == 'false'">
+ 
+             <Output TaskParameter="ResourceFilesWithManifestResourceNames" ItemName="_Temporary" />
+@@ -133,6 +138,7 @@ this file.
+         <CreateFSharpManifestResourceName
+               ResourceFiles="@(EmbeddedResource)"
+               RootNamespace="$(RootNamespace)"
++              UseStandardResourceNames="$(UseStandardResourceNames)"
+               PrependCultureAsDirectory="false"
+               Condition="'%(EmbeddedResource.ManifestResourceName)' == '' and '%(EmbeddedResource.WithCulture)' == 'true' and '%(EmbeddedResource.Type)' == 'Non-Resx' AND '$(UsingXBuild)' == 'false'">
+ 
+@@ -253,6 +259,7 @@ this file.
+               ToolExe="$(FscToolExe)"
+               ToolPath="$(FscToolPath)"
+               TreatWarningsAsErrors="$(TreatWarningsAsErrors)"
++              UseStandardResourceNames="$(UseStandardResourceNames)"
+               Utf8Output="$(Utf8Output)"
+               VersionFile="$(VersionFile)"
+               VisualStudioStyleErrors="$(VisualStudioStyleErrors)"
